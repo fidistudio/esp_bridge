@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>esp_bridge</name>
+  <version>0.0.0</version>
+  <description>Bridge entre ROS2 y ESP via serial</description>
+
+  <maintainer email="jorge.martinezram@ingenieria.unam.edu">fidel</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+
+  <!-- Dependencia del sistema -->
+  <build_depend>libserial-dev</build_depend>
+  <exec_depend>libserial-dev</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
