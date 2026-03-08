@@ -89,6 +89,11 @@ private:
 
   std::string formatTwistCommand(float linear, float angular) const {
     std::ostringstream stream;
+    if (abs(linear) < 1e-4 && abs(angular) < 1e-4) {
+      stream << std::fixed << std::setprecision(kDecimalPrecision);
+      stream << "stop" << "\n";
+      return stream.str();
+    }
     stream << std::fixed << std::setprecision(kDecimalPrecision);
     stream << "twist: " << linear << " " << angular << "\n";
     return stream.str();
