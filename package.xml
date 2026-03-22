@@ -3,7 +3,6 @@
   <name>esp_bridge</name>
   <version>0.0.0</version>
   <description>Bridge entre ROS2 y ESP via serial</description>
-
   <maintainer email="jorge.martinezram@ingenieria.unam.edu">fidel</maintainer>
   <license>Apache-2.0</license>
 
@@ -11,6 +10,10 @@
 
   <depend>rclcpp</depend>
   <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
 
   <!-- Dependencia del sistema -->
   <build_depend>libserial-dev</build_depend>
