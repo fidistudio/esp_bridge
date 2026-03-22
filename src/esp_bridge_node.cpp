@@ -1,13 +1,12 @@
 #include <chrono>
-#include <cstring>
+#include <cmath>
+#include <cstdio>
 #include <functional>
 #include <iomanip>
 #include <memory>
 #include <sstream>
 #include <string>
-#include <vector>
 
-#include <geometry_msgs/msg/quaternion.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -18,10 +17,6 @@
 
 #include <libserial/SerialPort.h>
 #include <libserial/SerialPortConstants.h>
-
-// TelemetryFrame debe ser accesible desde el paquete ROS2.
-// Copia TelemetryFrame.h al directorio include/ de tu paquete ROS2.
-#include "esp_bridge/TelemetryFrame.h"
 
 using namespace std::chrono_literals;
 using std::placeholders::_1;
@@ -35,7 +30,6 @@ public:
     createPublishers();
     createCmdVelSubscription();
     createReadTimer();
-
     RCLCPP_INFO(this->get_logger(), "EspBridgeNode iniciado");
   }
 
@@ -76,10 +70,8 @@ private:
   void createPublishers() {
     odom_pub_ =
         this->create_publisher<nav_msgs::msg::Odometry>("/odom", kQueueSize);
-
     joint_pub_ = this->create_publisher<sensor_msgs::msg::JointState>(
         "/joint_states", kQueueSize);
-
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
   }
 
@@ -89,117 +81,110 @@ private:
         std::bind(&EspBridgeNode::handleCmdVel, this, _1));
   }
 
-  // Timer a 200 Hz — lee el puerto sin bloquear; los frames llegan a 20 Hz
   void createReadTimer() {
     read_timer_ = this->create_wall_timer(
         5ms, std::bind(&EspBridgeNode::readSerial, this));
   }
 
   // -------------------------------------------------------------------------
-  // Lectura serial y sincronización de frame binario
+  // Lectura serial — acumula bytes hasta '\n', luego parsea
   // -------------------------------------------------------------------------
 
   void readSerial() {
     if (!serial_port_.IsOpen())
       return;
 
-    // Drenar bytes disponibles al buffer interno
     try {
       while (serial_port_.IsDataAvailable()) {
         uint8_t byte;
         serial_port_.ReadByte(reinterpret_cast<char &>(byte), 0);
-        rx_buf_.push_back(byte);
+
+        if (byte == '\n') {
+          parseLine(rx_line_);
+          rx_line_.clear();
+        } else {
+          rx_line_ += static_cast<char>(byte);
+          if (rx_line_.size() > 256)
+            rx_line_.clear();
+        }
       }
     } catch (...) {
-      return;
     }
+  }
 
-    // Intentar parsear frames completos
-    while (rx_buf_.size() >= TELEMETRY_FRAME_SIZE) {
-      // Buscar magic 0xAA55 — re-sincronización automática
-      if (rx_buf_[0] != 0xAA || rx_buf_[1] != 0x55) {
-        rx_buf_.erase(rx_buf_.begin());
-        continue;
-      }
-
-      // Verificar end marker
-      if (rx_buf_[TELEMETRY_FRAME_SIZE - 1] != TELEMETRY_END_MARKER) {
-        // Frame corrupto: descartar el magic y seguir buscando
-        rx_buf_.erase(rx_buf_.begin(), rx_buf_.begin() + 2);
-        continue;
-      }
-
-      // Frame completo y válido → deserializar
-      TelemetryFrame frame;
-      std::memcpy(&frame, rx_buf_.data(), sizeof(TelemetryFrame));
-      rx_buf_.erase(rx_buf_.begin(), rx_buf_.begin() + TELEMETRY_FRAME_SIZE);
-
-      publishOdom(frame.data);
-      publishJointStates(frame.data);
+  void parseLine(const std::string &line) {
+    double x, y, theta, vl, vr, pl, pr;
+    if (std::sscanf(line.c_str(), "ODOM %lf %lf %lf %lf %lf %lf %lf", &x, &y,
+                    &theta, &vl, &vr, &pl, &pr) == 7) {
+      publishOdom(x, y, theta, vl, vr);
+      publishJointStates(pl, pr, vl, vr);
     }
-
-    // Evitar que el buffer crezca indefinidamente si hay ruido
-    if (rx_buf_.size() > kMaxBufSize)
-      rx_buf_.erase(rx_buf_.begin(), rx_buf_.end() - TELEMETRY_FRAME_SIZE);
   }
 
   // -------------------------------------------------------------------------
   // Publicadores ROS2
   // -------------------------------------------------------------------------
 
-  void publishOdom(const TelemetryPayload &d) {
+  void publishOdom(double x_uwb, double y_uwb, double theta, double vl,
+                   double vr) {
     auto now = this->get_clock()->now();
 
-    // ---- Odometry message ----
+    // ── Offset UWB → base_footprint ────────────────────────────────────────
+    // UWB_joint está en xyz=(-0.22, 0, ...) respecto a body_link.
+    // base_footprint está +0.22 m adelante del UWB en el frame del robot.
+    constexpr double dx_uwb = 0.22;
+    constexpr double dy_uwb = 0.0;
+
+    const double cos_t = std::cos(theta);
+    const double sin_t = std::sin(theta);
+
+    const double x = x_uwb + cos_t * dx_uwb - sin_t * dy_uwb;
+    const double y = y_uwb + sin_t * dx_uwb + cos_t * dy_uwb;
+
+    // ── Odometría ───────────────────────────────────────────────────────────
     nav_msgs::msg::Odometry odom;
     odom.header.stamp = now;
     odom.header.frame_id = odom_frame_;
     odom.child_frame_id = base_frame_;
 
-    // Pose
-    odom.pose.pose.position.x = d.x;
-    odom.pose.pose.position.y = d.y;
+    odom.pose.pose.position.x = x;
+    odom.pose.pose.position.y = y;
     odom.pose.pose.position.z = 0.0;
 
     tf2::Quaternion q;
-    q.setRPY(0.0, 0.0, d.theta);
+    q.setRPY(0.0, 0.0, theta);
     odom.pose.pose.orientation.x = q.x();
     odom.pose.pose.orientation.y = q.y();
     odom.pose.pose.orientation.z = q.z();
     odom.pose.pose.orientation.w = q.w();
 
-    // Twist (velocidad del robot en frame base_link)
-    // v = (r_R·ω_R + r_L·ω_L) / 2
-    // ω = (r_R·ω_R - r_L·ω_L) / (2b)
-    constexpr double r = 0.31 / 2.0; // radio de rueda [m]
-    constexpr double b = 0.37 / 2.0; // semidistancia entre ruedas [m]
-    odom.twist.twist.linear.x = r * (d.vel_right + d.vel_left) / 2.0;
-    odom.twist.twist.angular.z = r * (d.vel_right - d.vel_left) / (2.0 * b);
+    constexpr double r = 0.31 / 2.0;
+    constexpr double b = 0.37 / 2.0;
+    odom.twist.twist.linear.x = r * (vr + vl) / 2.0;
+    odom.twist.twist.angular.z = r * (vr - vl) / (2.0 * b);
 
     odom_pub_->publish(odom);
 
-    // ---- TF: odom → base_link ----
+    // ── TF odom → base_footprint ────────────────────────────────────────────
     geometry_msgs::msg::TransformStamped tf;
     tf.header.stamp = now;
     tf.header.frame_id = odom_frame_;
     tf.child_frame_id = base_frame_;
-    tf.transform.translation.x = d.x;
-    tf.transform.translation.y = d.y;
+    tf.transform.translation.x = x;
+    tf.transform.translation.y = y;
     tf.transform.translation.z = 0.0;
     tf.transform.rotation = odom.pose.pose.orientation;
 
     tf_broadcaster_->sendTransform(tf);
   }
 
-  void publishJointStates(const TelemetryPayload &d) {
+  void publishJointStates(double pl, double pr, double vl, double vr) {
     sensor_msgs::msg::JointState js;
     js.header.stamp = this->get_clock()->now();
-
     js.name = {"wheel2_joint", "wheel1_joint"};
-    js.position = {d.pos_left, d.pos_right};
-    js.velocity = {d.vel_left, d.vel_right};
+    js.position = {pl, pr};
+    js.velocity = {vl, vr};
     js.effort = {0.0, 0.0};
-
     joint_pub_->publish(js);
   }
 
@@ -233,28 +218,20 @@ private:
   static constexpr int kDefaultBaudrate = 115200;
   static constexpr int kQueueSize = 10;
   static constexpr int kDecimalPrecision = 3;
-  static constexpr std::size_t kMaxBufSize = 512;
 
   // -------------------------------------------------------------------------
   // Miembros
   // -------------------------------------------------------------------------
 
-  // Publishers
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
-
-  // Subscriber
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel_sub_;
-
-  // Timer de lectura serial
   rclcpp::TimerBase::SharedPtr read_timer_;
 
-  // Serial
   LibSerial::SerialPort serial_port_;
-  std::vector<uint8_t> rx_buf_;
+  std::string rx_line_;
 
-  // Parámetros
   std::string port_;
   int baudrate_;
   std::string odom_frame_;
